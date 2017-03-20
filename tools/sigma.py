@@ -9,9 +9,10 @@ COND_OR   = 2
 COND_NOT  = 3
 
 class SigmaParser:
-    def __init__(self, sigma):
+    def __init__(self, sigma, config):
         self.definitions = dict()
         self.parsedyaml = yaml.safe_load(sigma)
+        self.config = config
 
     def parse_sigma(self):
         try:    # definition uniqueness check
@@ -68,6 +69,28 @@ class SigmaParser:
                 cond.add((key, value))
 
         return cond
+
+    def get_logsource(self):
+        """Returns logsource configuration object for current rule"""
+        try:
+            ls_rule = self.parsedyaml['logsource']
+        except KeyError:
+            return None
+
+        try:
+            category = ls_rule['category']
+        except KeyError:
+            category = None
+        try:
+            product = ls_rule['product']
+        except KeyError:
+            product = None
+        try:
+            service = ls_rule['service']
+        except KeyError:
+            service = None
+
+        return self.config.get_logsource(category, product, service)
 
 class SigmaConditionToken:
     """Token of a Sigma condition expression"""
@@ -219,6 +242,9 @@ class ConditionBase(ParseTreeNode):
     def __iter__(self):
         return iter(self.items)
 
+    def __len__(self):
+        return len(self.items)
+
 class ConditionAND(ConditionBase):
     """AND Condition"""
     op = COND_AND
@@ -291,6 +317,7 @@ class SigmaConditionParser:
             raise NotImplementedError("Aggregation expressions are not yet supported")
 
         self.sigmaParser = sigmaParser
+        self.config = sigmaParser.config
         self.parsedSearch = self.parseSearch(tokens)
 
     def parseSearch(self, tokens):
@@ -311,7 +338,7 @@ class SigmaConditionParser:
             if lPos > rPos:
                 raise SigmaParseError("Closing parentheses at position " + str(rTok.pos) + " precedes opening at position " + str(lTok.pos))
 
-            subparsed = self.parseSearch(tokens[lPos + 1:rPos])[0]
+            subparsed = self.parseSearch(tokens[lPos + 1:rPos])
             tokens = tokens[:lPos] + NodeSubexpression(subparsed) + tokens[rPos + 1:]   # replace parentheses + expression with group node that contains parsed subexpression
 
         # 2. Iterate over all known operators in given precedence
@@ -338,8 +365,26 @@ class SigmaConditionParser:
 
         if len(tokens) != 1:     # parse tree must begin with exactly one node
             raise ValueError("Parse tree must have exactly one start node!")
+        querycond = tokens[0]
 
-        return tokens
+        logsource = self.sigmaParser.get_logsource()
+        if logsource != None:
+            # 4. Integrate conditions from configuration
+            if logsource.conditions != None:
+                cond = ConditionAND()
+                cond.add(logsource.conditions)
+                cond.add(querycond)
+                querycond = cond
+
+            # 5. Integrate index conditions if applicable for backend
+            indexcond = logsource.get_indexcond()
+            if indexcond != None:
+                cond = ConditionAND()
+                cond.add(indexcond)
+                cond.add(querycond)
+                querycond = cond
+
+        return querycond
 
     def __str__(self):
         return str(self.parsedSearch)
@@ -348,17 +393,21 @@ class SigmaConditionParser:
         return len(self.parsedSearch)
 
     def getParseTree(self):
-        return(self.parsedSearch[0])
+        return(self.parsedSearch)
 
 # Configuration
 class SigmaConfiguration:
     """Sigma converter configuration. Contains field mappings and logsource descriptions"""
     def __init__(self, configyaml=None):
         if configyaml == None:
+            self.config = None
             self.fieldmappings = dict()
             self.logsources = dict()
+            self.logsourcemerging = SigmaLogsourceConfiguration.MM_AND
+            self.backend = None
         else:
             config = yaml.safe_load(configyaml)
+            self.config = config
 
             try:
                 self.fieldmappings = config['fieldmappings']
@@ -368,26 +417,12 @@ class SigmaConfiguration:
                 raise SigmaConfigParseError("Fieldmappings must be a map")
 
             try:
-                self.logsources = config['logsources']
+                self.logsourcemerging = config['logsourcemerging']
             except KeyError:
-                self.logsources = dict()
+                self.logsourcemerging = SigmaLogsourceConfiguration.MM_AND
 
-            if type(self.logsources) != dict:
-                raise SigmaConfigParseError("Logsources must be a map")
-            for name, logsource in self.logsources.items():
-                if type(logsource) != dict:
-                    raise SigmaConfigParseError("Logsource definitions must be maps")
-                if 'category' in logsource and type(logsource['category']) != str \
-                        or 'product' in logsource and type(logsource['product']) != str \
-                        or 'service' in logsource and type(logsource['service']) != str:
-                    raise SigmaConfigParseError("Logsource category, product or service must be a string")
-                if 'index' in logsource:
-                    if type(logsource['index']) not in (str, list):
-                        raise SigmaConfigParseError("Logsource index must be string or list of strings")
-                    if type(logsource['index']) == list and not set([type(index) for index in logsource['index']]).issubset({str}):
-                        raise SigmaConfigParseError("Logsource index patterns must be strings")
-            if 'conditions' in logsource and type(logsource['conditions']) != dict:
-                raise SigmaConfigParseError("Logsource conditions must be a map")
+            self.logsources = list()
+            self.backend = None
 
     def get_fieldmapping(self, fieldname):
         """Return mapped fieldname if mapping defined or field name given in parameter value"""
@@ -395,6 +430,155 @@ class SigmaConfiguration:
             return self.fieldmappings[fieldname]
         except KeyError:
             return fieldname
+
+    def get_logsource(self, category, product, service):
+        """Return merged log source definition of all logosurces that match criteria"""
+        matching = [logsource for logsource in self.logsources if logsource.matches(category, product, service)]
+        return SigmaLogsourceConfiguration(matching)
+
+    def set_backend(self, backend):
+        """Set backend. This is used by other code to determine target properties for index addressing"""
+        self.backend = backend
+        if self.config != None:
+            if 'logsources' in self.config:
+                logsources = self.config['logsources']
+                if type(logsources) != dict:
+                    raise SigmaConfigParseError("Logsources must be a map")
+                for name, logsource in logsources.items():
+                    self.logsources.append(SigmaLogsourceConfiguration(logsource, name, self.logsourcemerging, self.get_indexfield()))
+
+    def get_indexfield(self):
+        """Get index condition if index field name is configured"""
+        if self.backend != None:
+            return self.backend.index_field
+
+class SigmaLogsourceConfiguration:
+    """Contains the definition of a log source"""
+    MM_AND = "and"  # Merge all conditions with AND
+    MM_OR  = "or"   # Merge all conditions with OR
+
+    def __init__(self, logsource=None, name=None, mergemethod=MM_AND, indexfield=None):
+        self.name = name
+        self.indexfield = indexfield
+        if logsource == None:               # create empty object
+            self.category = None
+            self.product = None
+            self.service = None
+            self.index = list()
+            self.conditions = None
+        elif type(logsource) == list and all([isinstance(o, SigmaLogsourceConfiguration) for o in logsource]):      # list of SigmaLogsourceConfigurations: merge according to mergemethod
+            # Merge category, product and service
+            categories = set([ ls.category for ls in logsource if ls.category != None ])
+            products = set([ ls.product for ls in logsource if ls.product != None ])
+            services = set([ ls.service for ls in logsource if ls.service != None])
+            if len(categories) > 1 or len(products) > 1 or len(services) > 1:
+                raise ValueError("Merged SigmaLogsourceConfigurations must have disjunct categories, products and services")
+
+            try:
+                self.category = categories.pop()
+            except KeyError:
+                self.category = None
+            try:
+                self.product = products.pop()
+            except KeyError:
+                self.product = None
+            try:
+                self.service = services.pop()
+            except KeyError:
+                self.service = None
+
+            # Merge all index patterns
+            self.index = list(set([index for ls in logsource for index in ls.index]))       # unique(flat(logsources.index))
+
+            # "merge" index field (should never differ between instances because it is provided by backend class
+            indexfields = [ ls.indexfield for ls in logsource if ls.indexfield != None ]
+            try:
+                self.indexfield = indexfields[0]
+            except IndexError:
+                self.indexfield = None
+
+            # Merge conditions according to mergemethod
+            if mergemethod == self.MM_AND:
+                cond = ConditionAND()
+            elif mergemethod == self.MM_OR:
+                cond = ConditionOR()
+            else:
+                raise ValueError("Mergemethod must be '%s' or '%s'" % (self.MM_AND, self.MM_OR))
+            for ls in logsource:
+                if ls.conditions != None:
+                    cond.add(ls.conditions)
+            if len(cond) > 0:
+                self.conditions = cond
+            else:
+                self.conditions = None
+        elif type(logsource) == dict:       # create logsource configuration from parsed yaml
+            if 'category' in logsource and type(logsource['category']) != str \
+                    or 'product' in logsource and type(logsource['product']) != str \
+                    or 'service' in logsource and type(logsource['service']) != str:
+                raise SigmaConfigParseError("Logsource category, product or service must be a string")
+            try:
+                self.category = logsource['category']
+            except KeyError:
+                self.category = None
+            try:
+                self.product = logsource['product']
+            except KeyError:
+                self.product = None
+            try:
+                self.service = logsource['service']
+            except KeyError:
+                self.service = None
+            if self.category == None and self.product == None and self.service == None:
+                raise SigmaConfigParseError("Log source definition will not match")
+
+            if 'index' in logsource:
+                index = logsource['index']
+                if type(index) not in (str, list):
+                    raise SigmaConfigParseError("Logsource index must be string or list of strings")
+                if type(index) == list and not set([type(index) for index in logsource['index']]).issubset({str}):
+                    raise SigmaConfigParseError("Logsource index patterns must be strings")
+                if type(index) == list:
+                    self.index = index
+                else:
+                    self.index = [ index ]
+            else:
+                self.index = []
+
+            if 'conditions' in logsource:
+                if type(logsource['conditions']) != dict:
+                    raise SigmaConfigParseError("Logsource conditions must be a map")
+                cond = ConditionAND()
+                for key, value in logsource['conditions'].items():
+                    cond.add((key, value))
+                self.conditions = cond
+            else:
+                self.conditions = None
+        else:
+            raise SigmaConfigParseError("Logsource definitions must be maps")
+
+    def matches(self, category, product, service):
+        """Match log source definition against given criteria, None = ignore"""
+        searched = 0
+        for searchval, selfval in zip((category, product, service), (self.category, self.product, self.service)):
+            if searchval != None and selfval != None:
+                searched += 1
+                if searchval != selfval:
+                    return False
+        if searched:
+            return True
+
+    def get_indexcond(self):
+        """Get index condition if index field name is configured"""
+        cond = ConditionOR()
+        if self.indexfield:
+            for index in self.index:
+                cond.add((self.indexfield, index))
+            return cond
+        else:
+            return None
+
+    def __str__(self):
+        return "[ LogSourceConfiguration: %s %s %s indices: %s ]" % (self.category, self.product, self.service, str(self.index))
 
 class SigmaConfigParseError(Exception):
     pass

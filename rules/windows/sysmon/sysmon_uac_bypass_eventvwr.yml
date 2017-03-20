@@ -1,0 +1,19 @@
+title: UAC Bypass via Event Viewer
+status: experimental
+description: Detects UAC bypass method using Windows event viewer
+reference: 
+    - https://enigma0x3.net/2016/08/15/fileless-uac-bypass-using-eventvwr-exe-and-registry-hijacking/
+author: Florian Roth
+logsource:
+    product: windows
+    service: sysmon
+detection:
+    selection:
+        EventID: 1
+        ParentImage: '*\eventvwr.exe'
+    filter:
+        Image: '*\mmc.exe'
+    condition: selection and not filter
+falsepositives:
+    - unknown
+level: high
